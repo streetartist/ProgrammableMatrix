@@ -1,260 +1,168 @@
-# JBOX-S3：52 节点 / 8 网络 / 19 GPIO 的纯 API 可编程接线板
+# JBOX-S3 — 实体按钮免码配网与局域网纯 API 控制
 
-适用：**ESP32-S3-WROOM-1-N16R8** + **4 × CH446Q**，ESP-IDF **v5.5.x**。无网页，无 HTTP / WebSocket；控制采用 TCP 4747 二进制 API，BLE 仅用于首次 Wi-Fi 配网。
+目标：ESP32-S3-WROOM-1-N16R8 + 4×CH446Q。ESP-IDF **v5.5.x**。
 
-> **工程状态**：提供完整固件源代码与 PC 端 Python SDK，已运行主机侧单元测试；当前环境没有 ESP-IDF 工具链或真实硬件，因此**尚未实际 `idf.py build`、烧录或示波器验证**。首次投板前必须核验 CH446Q 供电/串行时序，尤其是电源与保护电路。
+短按实体按钮授权临时配网/绑定；手机通过 BLE 给设备送入 Wi-Fi SSID/密码；电脑经局域网发现设备并自动领用、保存设备控制密钥。以后二次连接自动 HMAC 鉴权。
 
-## 1. 主要能力
+> 状态：PC 端 Python SDK 单元测试和纯 C 路由规划测试已通过；当前环境未安装 ESP-IDF 工具链、未实板测试，不能保证无需调整即可在实际 ESP32-S3 上烧录或获得所列总线速度。投板前须核对硬件供电、保护、电气时序。
 
-| 项目 | 能力 |
-|---|---|
-| 交叉矩阵 | 52 个逻辑节点，经 4×CH446Q 选择 NET0～NET7；每节点最多属于 1 个网络 |
-| 控制网络 | **单客户端**、持久 TCP、固定 16 字节头、二进制请求/应答、无网页 |
-| 身份验证 | 首次 128-bit nonce + HMAC-SHA256；后续每帧 16B HMAC（防篡改/重放）；不加密内容 |
-| 配网 | ESP-IDF BLE Wi-Fi Provisioning（protocomm Security 1 + 每设备 PoP），成功后释放 BLE RAM |
-| GPIO | 共 **19 路**，EXT1～9 在 CH446Q 上，另外 10 路直出；数字输入/输出/开漏/批量读取写入 |
-| I²C | 2 个硬件 I²C master，可动态选择 SDA/SCL，7 位设备地址，Write/Read 和重复起始，自动缓存设备句柄 |
-| SPI | 2 个硬件主机（SPI2/3），动态 MOSI/MISO/SCK/CS，模式 0～3，全双工 DMA，单帧最多 4096 字节 |
-| UART | 硬件 UART1/UART2，动态 TX/RX，8 位数据，校验/停止位配置，4096B RX/2048B TX 驱动缓冲 |
-| PWM | 4 路 LEDC，13 位 duty；10Hz～40kHz 受分频/分辨率约束 |
-| ADC | ADC1 GPIO1～10，原始 12-bit 样本；GPIO11+ 等无 ADC1 |
-| 故障策略 | 上电全断开、GPIO 高阻；路由先断后连；Wi-Fi 客户端断线后全断开/停止外围外设；电源网络拒绝冲突 |
+## 1. 一颗按钮的交互
 
-### 重要限制
+**GPIO10** 作为专用、**高电平有效**配对按钮：
 
-1. **8 组是同时独立网络数量**，不是 8 个引脚。每条网络可并联多个洞洞板孔位。
-2. 禁止一条网络同时出现 5V / 3.3V / GND 的任意两个节点；禁止直连任意电源节点到 ESP32 GPIO；当前安全策略还禁止将两个 ESP32 EXT GPIO 直接并入同一网络（避免两个输出驱动争用）。
-3. 每组只支持点集的电气连通，不保存“某两点之间一根独立导线”的拓扑，移除一个节点不会自动分割多个网络。
-4. CH446Q 的导通电阻/寄生电容会影响 SPI、UART、I²C。**经矩阵连接的 SPI、UART 等高速信号必须逐档实测**。本代码的频率上限仅为软件限制，不代表硬件保证。建议 I²C 从 10～50kHz、SPI 从 100kHz、UART 从 9600～115200 开始验证。
-5. CH446Q（5V 单电源）不能代替低阻供电线。5V、3.3V、GND 接入 X 端仅供低电流实验；屏幕背光、较大 LED、模块供电应使用独立限流/低阻电源口。
-6. ESP32-S3 GPIO **不耐 5V**。必须为 EXT1～9 加硬件过压/限流保护。软件冲突检查不能防止用户在板外将其他信号线直接接 5V。
-7. HMAC 只提供鉴权和完整性，**不提供加密**；仅在可信的 WPA2/WPA3 局域网中使用，不要把 4747 端口直接映射到公网。
-8. 只支持一条在线控制 TCP 会话，串行执行硬件命令，避免多个客户端同时改动拓扑。每次会话断开，当前连接会主动清空；要持续工作，客户端应保持 TCP 会话（并配置心跳/自动重连）。
+- 按钮的一端接 **3.3V**，另一端接 **GPIO10**；GPIO10 对 GND 配 **10kΩ 外部下拉**，固件另外启用内部下拉。不得接 5V。
+- **短按（约 0.1 秒～6 秒）**：如果从未配置 Wi-Fi，则开启 **180 秒 BLE 配网窗口**；如果已有 Wi-Fi，则开启 **120 秒局域网 API 绑定窗口**。
+- **按住 6～12 秒后松开**：只清除 Wi-Fi 配置并重启，保留设备的控制密钥；下一次短按重新通过 BLE 配网。
+- **按住至少 12 秒后松开**：恢复出厂设置，清除 Wi-Fi 和设备控制密钥；下一次短按重新配置与绑定。
 
-## 2. 引脚分配
+按键逻辑为松开后识别短按或长按，带软件消抖。若初次 BLE 配网成功，程序**自动**额外打开 120 秒的局域网 API 绑定窗口，因此首次联网无需为 API 再按一次键。
 
-### ESP32-S3 GPIO
+GPIO10 **永久不再提供给 GPIO API**：9 个矩阵 EXT（GPIO1～9）+ 9 个直出（GPIO18、21、38～42、47、48）= **18 个可控制 GPIO**。CH446Q 控制、USB、UART0、PSRAM 管脚不变。
 
-| 用途 | GPIO |
-|---|---|
-| EXT1～EXT9（进入 CH446Q） | **1、2、3、4、5、6、7、8、9** |
-| DAT / CK / RST | **11 / 12 / 13** |
-| CH446Q U2/U3/U4/U5 的 STB | **14 / 15 / 16 / 17** |
-| USB D− / D+ | **19 / 20** |
-| UART0（调试）TX / RX | **43 / 44** |
-| BOOT | **0** |
-| EN | 复位 |
-| 10 个直出可编程 GPIO | **10、18、21、38、39、40、41、42、47、48** |
-| 禁止外接（N16R8 八线 PSRAM 占用） | **35、36、37** |
-| 启动特殊脚（本工程不使用） | **45、46** |
+## 2. 首次使用（全部免码，不读串口）
 
-**GPIO3 是启动配置管脚**：在未改变相关 JTAG eFuse 配置时可正常做 I/O，但复位瞬间不能任意强驱动。GPIO39～42 与外部 JTAG 复用，如启用硬件 JTAG 应避免占用。UART0 始终保留给调试。
-
-### GPIO API 的 IO ID（0～18）
-
-| IO ID | ESP32 GPIO | 是否经矩阵 |
-|---:|---:|---|
-| 0～8 | GPIO1～9 | 是，对应路由节点 40～48 |
-| 9 | GPIO10 | 否 |
-| 10 | GPIO18 | 否 |
-| 11 | GPIO21 | 否 |
-| 12 | GPIO38 | 否 |
-| 13～16 | GPIO39～42 | 否 |
-| 17 | GPIO47 | 否 |
-| 18 | GPIO48 | 否 |
-
-**注意**：`route node ID` 和 `IO ID` 是两个独立的编号体系。例如 IO0=ESP GPIO1，对应的路由节点是 **40**；洞洞板 H2-1 是节点 **0**。
-
-### 52 个路由节点和 CH446Q X 对应关系
-
-| CH446Q | X0～X15 |
-|---|---|
-| U2 (chip 0) | H2-1～H2-16，node **0～15** |
-| U3 (chip 1) | H2-17～H2-20 + H6-1～H6-12，node **16～31** |
-| U4 (chip 2) | H6-13～H6-20 + EXT1～EXT8，node **32～47** |
-| U5 (chip 3) | EXT9、5V、3.3V、GND，node **48～51**（X4～X15 备用） |
-
-四颗芯片：**Y0 全部接 NET0，Y1 全部接 NET1，……Y7 全部接 NET7。不同 NET 之间绝不能直接短接。**
-
-CH446Q LQFP44 物理引脚（需按 WCH 版本核对）：
-
-- X0～X15：`31,30,29,28,27,26,3,4,5,6,7,8,25,24,1,2`
-- Y0～Y7：`33,35,37,39,17,15,13,11`
-- VDD 38→5V，GND 12→GND，VEE 16→GND；P/-S 10→GND（串行）
-- DAT 36→GPIO11，CK 34→GPIO12，RST 41→GPIO13
-- STB 14：四颗分别→GPIO14、15、16、17
-- AX0～AX3 的 43/18/19/42→GND；AY0～AY2 的 20/21/40→GND
-- NC 9/22/23/32/44：悬空
-
-**硬件上电安全**：CH446Q 的 **RST 高电平有效**，硬件建议 RST **10kΩ 上拉至 3.3V**，保证 ESP32 复位时开关清零；4 根 STB 分别 10kΩ 下拉至 GND。固件启动时再明确脉冲复位。切勿沿用“RST 10k 下拉”造成上电前状态不确定。
-
-每颗 CH446Q 就近 100nF 去耦并参考官方供电规则布线。5V、3.3V、GND 进入矩阵需独立限流，非直接承担大电流。
-
-## 3. 编译 / 烧录
-
-ESP-IDF **5.5.x**（推荐相应 5.5 bugfix 发行版），不能直接照搬 6.x：ESP-IDF 6.x 的旧 `wifi_provisioning` 组件接口发生迁移。
+1. 安装 ESP-IDF 5.5.x，编译烧录工程。第一次烧录需要 USB/下载接口，但配网与使用阶段不需要看串口。
+2. 给板子上电，**短按 GPIO10 按钮**。手机安装乐鑫 **ESP BLE Provisioning** 应用，在蓝牙列表里发现名称为 `JBOX-xxxxxx` 的设备（后六位是 MAC 后缀）。
+3. 选择 **Security 1（无需 PoP）**。不输入验证码，PoP 留空，应用通过 BLE 发给设备 Wi-Fi SSID 和 Wi-Fi 密码。ESP32-S3 仅支持 2.4GHz Wi-Fi。
+4. 成功连接后 BLE 自动退出并释放内存。设备自动开启 **120 秒授权绑定窗口**。
+5. 电脑连接同一可互访局域网，在工程根目录执行：
 
 ```bash
-cd ProgrammableMatrixS3
-idf.py set-target esp32s3
-idf.py menuconfig   # 首次确认 N16R8: 16MB Flash、Octal 8MB PSRAM、BLE 开启
-idf.py build
-idf.py -p COM5 flash monitor    # Windows 示例；Linux 为 /dev/ttyUSB0 等
+python client/jbox_api.py discover
+python client/jbox_api.py info
+python client/jbox_api.py status
+# 如果希望明确执行绑定，也可先运行 python client/jbox_api.py pair
 ```
 
-`sdkconfig.defaults` 预设了 BLE、Octal PSRAM、16MB Flash 和快节拍 FreeRTOS 任务调度，但如有不同硬件版本，必须以实际模组参数为准。**不能因为源代码齐全就跳过硬件验证。**
+`discover` 通过 UDP 4748 广播自动找到设备 IP；**`info` 在首次使用、设备正处于按钮授权窗口时会自动执行绑定**，不需要你先执行 `pair`。如想明确手动触发，才使用 `pair` 命令。设备创建（或重用）内部 **256-bit 随机控制密钥**，客户端保存在用户目录 `~/.jbox/keys.json`，不在终端输出密钥。以后 `info/status/控制命令` 都自动读取密钥并鉴权，无需再次输入。
 
-首次启动 UART0 输出：
+- 若 120 秒到期：在 Wi-Fi 已连接时**短按一次按钮**，再运行 `info`（会自动绑定）或 `pair`。
+- 若有多台设备：`discover` 列出它们，用 `--host 192.168.x.x` 指定目标。已保存的密钥按设备 ID 持久化；IP 地址变化后自动发现并复用。
+- 若电脑在不同 VLAN、广播被路由器阻止：使用 `--host 设备IP`，这个 IP 可在路由器客户端列表找到；不需要 UART。
+- 如果必须做到用户连 Wi-Fi 密码都不输入，需要额外的路由器/手机支持（例如 WPS/DPP），**普通 BLE 配网本身无法知道路由器密码**。
 
-```text
-DEVICE KEY (copy to client and keep private): <64个十六进制字符>
-BLE SECURITY1 POP (keep private): <12个十六进制字符>
-BLE service name: JBOX-xxxxxx
-```
+**关于免码模式的安全边界**：BLE Security 1 在没有 PoP 时可保护被动窃听，但**不具备对主动中间人攻击的身份验证**。此外当前 TCP `PAIR` 在可信 LAN 内明文传送新绑定的随机密钥，只有**按钮开启的 120 秒内第一位请求者**能领取；攻击者若在这段时间能访问 LAN，也可能抢先领取或窃听。务必在可信 Wi-Fi / 隔离实验网络使用，绝不能把 TCP 4747 或 UDP 4748 暴露到公网。需要抵御恶意局域网参与者时，应升级为经过设备身份验证的 TLS 或 BLE OOB 方案；仅有按键不等同于密码学认证。
 
-这两个密钥存在 NVS，重启不变。开发阶段打印到 UART0，生产设备应改为出厂安全写入/贴签，避免每次串口打印秘密。
-
-## 4. BLE 配 Wi-Fi（不需要网页）
-
-首次未配网时 BLE GATT 服务名是 `JBOX-xxxxxx`，采用标准 ESP-IDF provisioning `protocomm`（Security 1，PoP 非空）。使用 ESP-IDF 提供的 `esp_prov.py` 或使用支持 Espressif Security 1 的 BLE 客户端：
-
-```bash
-cd "$IDF_PATH/tools/esp_prov"
-python esp_prov.py --transport ble --service_name JBOX-A1B2C3 \
-  --sec_ver 1 --pop 123456ABCDEF \
-  --ssid '你的WiFi名' --passphrase '你的WiFi密码'
-```
-
-示例设备名与 PoP 请替换成 **UART0 实际打印值**。成功后 UART0 输出 IP 地址，BLE 服务自动停止并回收内存；随后的操作只走 TCP API。
-
-重新配网：已连接时发 `factory_reset()` 会擦除 NVS（**Wi-Fi 信息和设备密钥也会一起删除**）并重启；如果 IP 完全失联，可通过 `idf.py erase-flash` 重新擦除。建议下一版硬件加物理长按配网复位按键。
-
-## 5. Python API 的最简单用法
-
-PC 侧 **只需 Python 3.10+ 标准库**；不需要额外 pip 包。
-
-```python
-import os
-from client.jbox_api import MatrixClient
-
-with MatrixClient('192.168.1.88', os.environ['JBOX_KEY']) as device:
-    print(device.caps())
-
-    # 将 ESP GPIO1 -> H2-1，ESP GPIO2 -> H2-2
-    # [40,0] 占用 NET0；[41,1] 占用 NET1
-    device.route_set([[40, 0], [41, 1]])
-
-    # 两个外部 IO 分别映射为 SDA、SCL，由 ESP32 硬件 I2C 执行
-    device.i2c_setup(bus=0, sda=0, scl=1, hz=50000)
-    print([hex(x) for x in device.i2c_scan(0)])
-    device.i2c_close(0)
-
-    # GPIO 开关：IO9 = ESP GPIO10，直接引出，不经矩阵
-    device.gpio_config(9, mode=1, initial=0)
-    device.gpio_write({9:1})
-```
-
-**I²C 必须外接实际 3.3V 上拉电阻**，推荐 4.7kΩ 起步并实测，不能直接把 SDA 或 SCL 连到 3.3V 电源节点，否则会造成永久高电平短接。LCD/OLED 电源从独立低阻接口供电。
-
-命令行示例（PowerShell）：
+## 3. ESP-IDF 编译、烧录
 
 ```powershell
-$env:JBOX_KEY="从设备UART0读出的64位十六进制密钥"
-python client/jbox_api.py --host 192.168.1.88 info
-python client/jbox_api.py --host 192.168.1.88 status
-python client/jbox_api.py --host 192.168.1.88 connect 0 20
-python client/jbox_api.py --host 192.168.1.88 gpio-read 0 1 9
+cd ProgrammableMatrixS3
+idf.py set-target esp32s3
+idf.py menuconfig
+idf.py build
+idf.py -p COM5 flash
 ```
 
-每次独立 CLI 命令退出时，**固件会自动断开矩阵并让所有 GPIO 恢复高阻**，用于减少“远程用户掉线后仍上电”的风险。要持久保持连接，请在同一个 Python `with MatrixClient(...)` 会话里连续操作，不要用多次 CLI 命令维持电路。
+`COM5` 按实际端口修改。`sdkconfig.defaults` 预置 ESP32-S3、16MB Flash、Octal 8MB PSRAM、BLE、Wi-Fi。UART0（GPIO43/44）仍保留用于开发调试，但**所有正常配网/绑定操作都不需要 UART**。
 
-## 6. 二进制 TCP API 协议
+配对按钮不需要预存设备名、密码、ID、配对码，也无需印刷 QR 码。BLE 名称由设备 MAC 自动生成。
 
-连接到 `IP:4747`，默认同一时间只有 **1 条控制会话**。所有整数**小端**，每条帧：
+## 4. ESP32-S3 GPIO 资源
 
-| 偏移 | 字段 | 长度 |
-|---:|---|---:|
-| 0 | ASCII 魔数 `JMX1` | 4 |
-| 4 | 协议版本：`1` | 1 |
-| 5 | Command ID | 1 |
-| 6 | flags：`1`=response, `2`=含 HMAC | 2 |
-| 8 | sequence（单会话递增 uint32） | 4 |
-| 12 | payload length（<=8192） | 4 |
-| 16 | payload | 0～8192 |
-| 16+len | HMAC-SHA256 前 16 字节（认证后必须） | 16 |
-
-应答的 payload 最前面带 `int32 status`，后面才是命令的返回数据。`0` 表示成功，`-1` 参数错误，`-2` 资源占用，`-3` 硬件失败，`-4` 危险连接，`-5` 不支持，`-6` 超时，`-9` 网络资源不足，`-10` 未配置。
-
-### 鉴权顺序
-
-1. 请求 `0x01 HELLO`（无 MAC），得到 16-byte nonce。
-2. 请求 `0x02 AUTH`，payload=`HMAC-SHA256(device_key,nonce||"JMX-AUTH-v1")` 共 32B。
-3. 会话密钥 `HMAC-SHA256(device_key,nonce||"JMX-SESSION-v1")`。
-4. AUTH 回复及之后每一请求/回复均带 `HMAC(session_key,header||payload)[:16]`，请求 sequence 必须单调递增。
-
-认证内容完整性但**不加密数据**。只在可信局域网使用。Python SDK 已自动处理会话协商、HMAC、分帧和序号，不建议手写协议客户端。
-
-### 命令清单（payload 为二进制；所有长度最多 4096B）
-
-| CMD | 请求字段 | 返回字段（除 status 外） |
+| 用途 | 物理 GPIO | GPIO API ID |
 |---|---|---|
-| `0x10 CAPS` | 无 | `u8 version,nodes,nets,ios;u16 max_xfer,port;u8 gpio[19]` |
-| `0x11 STATUS` | 无 | `u32 uptime_ms,free_heap;u64 nets[8];u8 mode[19],lease[19]` |
-| `0x20 ROUTE_SET` | `u64 masks[8]` | `u64 masks[8]` |
-| `0x21 CONNECT` | `u8 a,b`（node ID） | `u8 net;u64 masks[8]` |
-| `0x22 REMOVE_NODE` | `u8 node` | `u64 masks[8]` |
-| `0x23 ROUTE_CLEAR` | 无 | 无 |
-| `0x30 IO_CONFIG` | `u8 io,mode,pull,initial` | 无 |
-| `0x31 IO_WRITE` | `u32 mask,levels` | 无 |
-| `0x32 IO_READ` | `u32 mask` | `u32 levels` |
-| `0x33 PWM` | `u8 channel,io;u32 hz;u16 duty` | 无（io=255 停止通道） |
-| `0x34 ADC_READ` | `u8 io` | `u32 adc_raw`（需先 `IO_CONFIG` 为 ADC） |
-| `0x40 I2C_SETUP` | `u8 bus,sda_io,scl_io;u32 hz` | 无 |
-| `0x41 I2C_CLOSE` | `u8 bus` | 无 |
-| `0x42 I2C_XFER` | `u8 bus,addr;u16 txlen,rxlen;u8 tx[txlen]` | `u8 rx[rxlen]` |
-| `0x50 SPI_SETUP` | `u8 bus,mosi,miso,sck,cs,mode;u32 hz` | 无（miso=255 写模式） |
-| `0x51 SPI_XFER` | `u8 bus;u16 len;u8 tx[len]` | `u8 rx[len]` |
-| `0x52 SPI_CLOSE` | `u8 bus` | 无 |
-| `0x60 UART_SETUP` | `u8 bus,tx,rx;u32 baud;u8 parity,stopbits` | 无 |
-| `0x61 UART_WRITE` | `u8 bus;u8 data[]` | `u16 bytes_written` |
-| `0x62 UART_READ` | `u8 bus;u16 max_count,timeout_ms` | `u8 data[]` |
-| `0x63 UART_CLOSE` | `u8 bus` | 无 |
-| `0x70 SAFE` | 无 | 清路由、释放外设、所有 IO 高阻 |
-| `0x7F FACTORY_RESET` | ASCII `YES!` | 清空 NVS，之后自动重启 |
+| 9 路进入 CH446Q 矩阵 | GPIO1,2,3,4,5,6,7,8,9 | 0～8 |
+| **配对按钮**（高电平触发） | **GPIO10** | **不对外开放** |
+| 9 路直出可编程 IO | GPIO18,21,38,39,40,41,42,47,48 | 9～17 |
+| CH446Q DAT/CK/RST | GPIO11/12/13 | 保留 |
+| CH446Q U2/U3/U4/U5 STB | GPIO14/15/16/17 | 保留 |
+| 原生 USB D−/D+ | GPIO19/20 | 保留 |
+| UART0 TX/RX | GPIO43/44 | 保留 |
+| BOOT | GPIO0 | 保留 |
+| PSRAM 占用 | GPIO35/36/37 | 不使用 |
+| 启动特殊脚 | GPIO45/46 | 保留 |
 
-**IO_CONFIG.mode**：0 输入、1 推挽输出、2 开漏、3 ADC；pull：0 无、1 上拉、2 下拉。`UART_SETUP`: bus0/1 分别硬件 UART1/UART2；parity 0 无 1 偶 2 奇；stopbits 1/2。`I2C_SETUP`: bus0/1 为 I²C0/I²C1。`SPI_SETUP`: bus0/1 为 SPI2/SPI3；MISO 可设 255（输出专用）。`I2C_XFER`: tx=0/rx=0 是硬件 ACK 探测。
+GPIO3 是 strapping 引脚，外部矩阵必须保证上电期间不被错误驱动。GPIO39～42 和 JTAG 可能互斥。
 
-同一个 IO 不能同时作为多个总线的引脚；尝试修改已经被 SPI/I²C/UART/PWM 占用的 IO 会收到 `-2`。关闭外设后可重新配置。
+## 5. CH446Q 节点映射、8 网络
 
-### 性能与可靠性设计
+52 个路由 Node ID：0～19 为 H2-1～20，20～39 为 H6-1～20，40～48 为 9 个 EXT，49=5V，50=3.3V，51=GND。
 
-- Wi-Fi 禁用 modem-sleep（`WIFI_PS_NONE`），TCP 采用长连接、`TCP_NODELAY`、内核 keepalive，不做逐位网络远程 bit-bang。
-- I²C 使用原生硬件 controller，设备句柄复用；SPI 使用硬件 master 和 DMA；UART 用中断 ring-buffer；GPIO 支持 19bit 批量写入/读取。
-- 路由更新分两阶段：先断开**所有**变化的旧路径，再建立新路径，无需整体复位重写所有开关。32/52 节点映射有主机测试。
-- 控制单会话避免多客户端并发抢占 UART/SPI 引脚；收发限定帧长、防内存越界、序号防重放、HMAC 防恶意写入。
-- GPIO 上电先配置高阻；会话中断则全部关闭。BLE 仅在初次配网期间工作，减少长期 Wi-Fi 抖动与堆内存开销。
-- **这些是设计机制，不是实测速度保证**。实际延迟、稳定波特率取决于 PCB 走线、CH446Q 电阻、电源、AP、负载与固件版本。
+| CH446Q | X0～X15 的节点 |
+|---|---|
+| U2 | H2-1～16（node 0～15） |
+| U3 | H2-17～20（node 16～19）+ H6-1～12（node 20～31） |
+| U4 | H6-13～20（node 32～39）+ EXT1～8（node 40～47） |
+| U5 | EXT9（node 48）、5V、3.3V、GND（node 49～51）；X4～X15 备用 |
 
-## 7. 测试
+四颗同名 Y0～Y7 全部并联成 `NET0`～`NET7`；不同 NET 不能互连。软件最多管理 8 个相互独立网络，同一网络可同时含多个节点；电源冲突、两个 MCU EXT 直接相互连接等有安全限制。
 
-没有 ESP-IDF 工具链时可先运行 PC 单元测试：
+CH446Q LQFP44 引脚：X0～X15 为 `31,30,29,28,27,26,3,4,5,6,7,8,25,24,1,2`；Y0～Y7 为 `33,35,37,39,17,15,13,11`；VDD=38→5V、GND=12→GND、VEE=16→GND、P/-S=10→GND，DAT=36→GPIO11、CK=34→GPIO12、RST=41→GPIO13、STB=14 分别→GPIO14～17；AX0～AX3=43/18/19/42→GND、AY0～AY2=20/21/40→GND，NC=9/22/23/32/44 悬空。**按照 CH446Q 当前采购批次官方资料再核验引脚**。
+
+CH446Q 的 RST 高电平有效，板上建议硬件上电时保持清零的复位电路；4 路 STB 下拉。CH446Q 不能当成低阻电源线，5V/3.3V/GND 应独立限流，EXT1～9 要做过压保护，否则 5V 连入 ESP32 可能永久损坏芯片。
+
+## 6. Python SDK 控制示例
+
+```python
+from client.jbox_api import discover_devices, MatrixClient
+
+devices = discover_devices()
+assert len(devices) == 1, "需要指定目标设备"
+with MatrixClient(devices[0]['host']) as board:
+    print(board.caps())
+
+    # EXT1 (node40) 连 H2-1(node0)，EXT2 (node41) 连 H2-2(node1)
+    board.route_set([[40, 0], [41, 1]])
+    board.i2c_setup(bus=0, sda=0, scl=1, hz=50000)
+    print([hex(x) for x in board.i2c_scan(0)])
+    board.i2c_close(0)
+
+    # IO9 为直出 GPIO18，与 GPIO10 配对按钮无关
+    board.gpio_config(9, mode=1, initial=0)
+    board.gpio_write({9: 1})
+    board.safe()
+```
+
+对于通过 CH446Q 的 I²C，必须外接物理 SDA/SCL 上拉电阻（如 4.7kΩ 作为初始参考），不能将 I²C 线直接短接到 3.3V 电源。通过矩阵传输的 SPI、UART 要从低速验证。
+
+其他支持的 API（Python SDK）：`connect_nodes`、`remove_node`、`route_clear`、`gpio_config/read/write`、`adc_read`、`pwm`、`i2c_setup/xfer/close`、`spi_setup/xfer/close`、`uart_setup/read/write/close`、`safe`、`factory_reset`。详见 `client/jbox_api.py`、`client/demo_i2c.py`、`client/demo_spi_uart.py`。
+
+**重要**：设备只允许一个 TCP 控制会话，断开会清空路由并把 GPIO 恢复为高阻；想持续维持连线，必须保持一个长连接。命令行执行完就断开，适合诊断，不适合常驻电路。
+
+## 7. 纯二进制协议与鉴权
+
+- **设备发现**：UDP 端口 4748，广播字节 `JBOX-DISCOVER`；设备单播 ASCII `JBOX-HERE|<12位十六进制MAC>|<paired0/1>|<window0/1>`。不包含任何密钥。
+- **控制**：TCP 端口 4747。协议 `JMX1`，固定 16 字节头 + payload（最长 8192B）+ 认证后 16 字节 HMAC 标签；整数小端；header=`magic[4],version:u8,cmd:u8,flags:u16,seq:u32,payload_len:u32`。
+- **物理绑定**：按钮打开 120 秒窗口，TCP `CMD_PAIR=0x03`，无负载、无需 MAC，成功应答 `int32 status=0` 后跟 32B 随机密钥；只能第一客户端领取，立即锁窗；客户端自动存本地文件且不打印。**绑定交换没有 TLS，只适合可信 LAN**。进入配对窗口会中止原控制会话并将 IO 恢复到安全状态，以便让新控制端绑定。
+- **普通鉴权**：连接后 `HELLO=0x01` 取 16B nonce；`AUTH=0x02` 提交 `HMAC-SHA256(device_key, nonce||"JMX-AUTH-v1")`；会话密钥 `HMAC-SHA256(device_key, nonce||"JMX-SESSION-v1")`；后续所有请求/应答均带 `HMAC(session_key,header||payload)[:16]`，序号单调递增。HMAC 保护身份和完整性，但**不加密控制内容**。
+- **性能**：长连接、`TCP_NODELAY`，不采用逐 bit 网络模拟。I²C/SPI/UART 使用 ESP32-S3 硬件外设；GPIO 支持位掩码批量读写；矩阵通过先断后连两阶段刷新。CPU/无线网络和模拟开关电气指标会决定实际速率。
+
+### 命令集合
+
+| 命令 | ID | 二进制请求字段 |
+|---|---|---|
+| HELLO / AUTH / PAIR | `01/02/03` | 分别无/32B Proof/无 |
+| CAPS / STATUS | `10/11` | 无 |
+| ROUTE_SET | `20` | `u64 masks[8]` |
+| CONNECT / REMOVE_NODE / ROUTE_CLEAR | `21/22/23` | `u8 a,b` / `u8 node` / 无 |
+| IO_CONFIG / IO_WRITE / IO_READ | `30/31/32` | `u8 io,mode,pull,initial` / `u32 mask,levels` / `u32 mask` |
+| PWM / ADC_READ | `33/34` | `u8 channel,io;u32 hz;u16 duty` / `u8 io` |
+| I2C_SETUP / I2C_CLOSE / I2C_XFER | `40/41/42` | `u8 bus,sda,scl;u32 hz` / `u8 bus` / `u8 bus,addr;u16 txlen,rxlen;u8 tx[]` |
+| SPI_SETUP / SPI_XFER / SPI_CLOSE | `50/51/52` | `u8 bus,mosi,miso,sck,cs,mode;u32 hz` / `u8 bus;u16 len;u8 tx[]` / `u8 bus` |
+| UART_SETUP / UART_WRITE / UART_READ / UART_CLOSE | `60/61/62/63` | `u8 bus,tx,rx;u32 baud;u8 parity,stopbits` / `u8 bus;u8 data[]` / `u8 bus;u16 max_count,timeout_ms` / `u8 bus` |
+| SAFE / FACTORY_RESET | `70/7F` | 无 / ASCII `YES!`（已鉴权） |
+
+GPIO IO ID 范围 **0～17**。SPI 总线支持 SPI2/3、DMA，UART1/2 支持缓冲收发、保留 UART0；I²C0/1 主机事务和重复起始；ADC1 和 4 路 PWM。硬件输出速度上限不是实测保证。
+
+错误码：`0` 成功，`-1` 参数错误，`-2` 资源占用，`-3` 硬件故障，`-4` 高风险连线，`-5` 不支持，`-6` 超时，`-9` 8 网络资源用尽，`-10` 未配置。通信安全错误与无授权绑定返回认证错误。
+
+## 8. 纯主机测试
 
 ```bash
 python -m unittest discover -s tests -p 'test_client.py' -v
-# 带 GCC 的 Linux/WSL：
-gcc -std=c11 -Wall -Wextra -Werror -I main \
-    main/route_plan.c tests/test_routes.c -o /tmp/jbox_routes
+# Linux / WSL:
+gcc -std=c11 -Wall -Wextra -Werror -I main main/route_plan.c tests/test_routes.c -o /tmp/jbox_routes
 /tmp/jbox_routes
 ```
 
-**建议真实硬件验收顺序**：先只接 MCU+CH446Q 控制线，验证 STB/RST 及每个交叉点的导通/断开；再验证 LED 的低电流网络、通用 GPIO；再以 10～50kHz I²C 测试上升沿与 ACK；然后逐步尝试 SPI、UART、PWM/ADC。没有做过流保护前不要连接 5V、3.3V、GND 的电源矩阵 X 引脚。
+### 推荐实板验收顺序
 
-## 8. 外部文档
+1. 仅给 MCU 和 CH446Q 控制电路上电，验证 4 个 STB、RST 时序及 52 节点映射。
+2. 测 GPIO10 按钮短按 BLE 180 秒广告、无 PoP、BLE 配网后 IP 获取及 120 秒 LAN 绑定；断电重启后确认不再要求配网/密钥。
+3. 测短按重新开放 LAN 绑定，长按 6 秒仅擦 Wi-Fi、12 秒完整恢复出厂设置。
+4. 测 18 GPIO 高阻默认、矩阵路由安全检查、电源误接防护；随后以低电流 LED 实验。
+5. 测 I²C 10～50kHz、UART 9600～115200、SPI 100kHz 起逐步验证；长时间稳定性压测与意外 Wi-Fi 断开安全状态。
 
-- WCH《CH446Q/CH446X》官方数据表：[wch.cn](https://www.wch.cn/downloads/CH446DS1.PDF.html?type=en)
-- ESP-IDF 5.5.x：[Wi-Fi BLE Provisioning](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32s3/api-reference/provisioning/wifi_provisioning.html)
-- ESP-IDF：[I²C Master](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32s3/api-reference/peripherals/i2c.html)
-- ESP-IDF：[SPI Master](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/peripherals/spi_master.html)
-- ESP-IDF：[UART Driver](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/peripherals/uart.html)
+无屏幕/无 UART 提示时，建议硬件后续增加状态 LED：等待配网、配网中、联网、配对成功、错误各有不同闪烁状态（此版不占用第 9 个直出 IO 实现 LED）。
 
-工程仅提供软件接口和基础故障隔离策略；**不构成已完成安全认证的电源路由硬件设计**。
+官方文档：[ESP-IDF Wi-Fi BLE Provisioning](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32s3/api-reference/provisioning/wifi_provisioning.html)；[CH446Q](https://www.wch.cn/downloads/CH446DS1_PDF.html)。

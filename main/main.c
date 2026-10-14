@@ -6,7 +6,7 @@
 #include "secrets.h"
 #include "wifi_ble.h"
 #include "net.h"
-#include "bootloader_random.h"
+#include "button.h"
 
 void app_main(void)
 {
@@ -17,12 +17,11 @@ void app_main(void)
     ESP_ERROR_CHECK(e);
     // VERY FIRST: matrix safe state and all 19 user IOs high-impedance.
     matrix_init();
-    // Generate NVS secrets with true hardware entropy BEFORE radio/ADC startup.
-    bootloader_random_enable();
+    // Binding secret is created only after a hardware-authorized claim.
     secrets_init();
-    bootloader_random_disable();
     peripherals_init();
     wifi_ble_start();
     net_start();
-    ESP_LOGI("JBOX","ready: 52 nodes / 8 nets / 19 controllable GPIO; UART0 at GPIO43/44");
+    button_start();
+    ESP_LOGI("JBOX","ready: 52 nodes / 8 nets / 18 controllable GPIO / GPIO10 pairing button; UART0 at GPIO43/44");
 }

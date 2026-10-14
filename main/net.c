@@ -10,6 +10,9 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include "esp_system.h"
+#include "esp_mac.h"
+#include "freertos/portmacro.h"
+#include <stdio.h>
 #include "mbedtls/md.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -27,6 +30,49 @@
 static const char *TAG="JBOX-API";
 static const uint8_t magic[4]={'J','M','X','1'};
 static uint32_t g_commands=0;
+static portMUX_TYPE g_pair_lock=portMUX_INITIALIZER_UNLOCKED;
+static uint32_t g_pair_deadline_s=0;
+static uint32_t g_pair_epoch=0;
+
+void net_pair_open(unsigned seconds)
+{
+    uint32_t now=(uint32_t)(esp_timer_get_time()/1000000LL);
+    portENTER_CRITICAL(&g_pair_lock);
+    g_pair_deadline_s=now+seconds;
+    ++g_pair_epoch; // Invalidate any previously authenticated control session.
+    portEXIT_CRITICAL(&g_pair_lock);
+}
+void net_pair_close(void)
+{
+    portENTER_CRITICAL(&g_pair_lock);
+    g_pair_deadline_s=0;
+    portEXIT_CRITICAL(&g_pair_lock);
+}
+bool net_pair_is_open(void)
+{
+    uint32_t now=(uint32_t)(esp_timer_get_time()/1000000LL);
+    portENTER_CRITICAL(&g_pair_lock);
+    bool open=g_pair_deadline_s!=0 && (int32_t)(g_pair_deadline_s-now)>0;
+    portEXIT_CRITICAL(&g_pair_lock);
+    return open;
+}
+static uint32_t net_pair_epoch(void)
+{
+    portENTER_CRITICAL(&g_pair_lock);
+    uint32_t v=g_pair_epoch;
+    portEXIT_CRITICAL(&g_pair_lock);
+    return v;
+}
+static bool net_pair_claim(void)
+{
+    uint32_t now=(uint32_t)(esp_timer_get_time()/1000000LL);
+    portENTER_CRITICAL(&g_pair_lock);
+    bool granted=g_pair_deadline_s!=0 && (int32_t)(g_pair_deadline_s-now)>0;
+    if(granted)g_pair_deadline_s=0; // first claimant wins, no second leak
+    portEXIT_CRITICAL(&g_pair_lock);
+    return granted;
+}
+
 static uint32_t le32(const uint8_t *p){return (uint32_t)p[0] |((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);}
 static void put32(uint8_t *p,uint32_t x){for(int i=0;i<4;i++)p[i]=(uint8_t)(x>>(8*i));}
 static void put16(uint8_t *p,uint16_t x){p[0]=x;p[1]=x>>8;}
@@ -46,11 +92,12 @@ static int hmac2(const uint8_t *key,size_t nk,const uint8_t *a,size_t na,
     mbedtls_md_free(&ctx);
     return ok;
 }
-static int recv_full(int fd,uint8_t *buf,size_t n,int32_t timeout_ms)
+static int recv_full(int fd,uint8_t *buf,size_t n,int32_t timeout_ms,uint32_t epoch)
 {
     size_t done=0;
     int64_t started=esp_timer_get_time();
     while(done<n){
+        if(net_pair_epoch()!=epoch)return -1;
         int ret=recv(fd,buf+done,n-done,0);
         if(ret>0){done+=ret;continue;}
         if(ret==0)return -1;
@@ -110,29 +157,55 @@ static void client_session(int fd)
     uint8_t nonce[16]={0},session[32]={0};
     bool have_hello=false,authenticated=false;
     uint32_t last_seq=0;
+    uint32_t pair_epoch=net_pair_epoch();
     struct timeval rcvto={.tv_sec=2,.tv_usec=0};
     struct timeval sndto={.tv_sec=3,.tv_usec=0};
     setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&rcvto,sizeof rcvto);
     setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&sndto,sizeof sndto);
-    while(wifi_is_ready()) {
+    while(wifi_is_ready() && net_pair_epoch()==pair_epoch) {
         uint8_t h[FRAME_LEN],mac[TAG_LEN];
-        if(recv_full(fd,h,sizeof h,authenticated?0:10000)!=0)break;
+        if(recv_full(fd,h,sizeof h,authenticated?0:10000,pair_epoch)!=0)break;
         if(memcmp(h,magic,4)!=0 || h[4]!=VER)break;
         uint8_t cmd=h[5];uint16_t flags=(uint16_t)h[6]|(uint16_t)h[7]<<8;
         uint32_t seq=le32(h+8),len=le32(h+12);
         if(flags & ~(uint16_t)FLAG_HMAC)break;
         if(len>API_MAX_PAYLOAD)break;
-        if(recv_full(fd,payload,len,authenticated?0:10000)!=0)break;
-        if(flags&FLAG_HMAC) if(recv_full(fd,mac,TAG_LEN,authenticated?0:10000)!=0)break;
+        if(recv_full(fd,payload,len,authenticated?0:10000,pair_epoch)!=0)break;
+        if(flags&FLAG_HMAC) if(recv_full(fd,mac,TAG_LEN,authenticated?0:10000,pair_epoch)!=0)break;
         if(!authenticated){
             if(flags!=0)break;
+            if(cmd==CMD_PAIR && len==0){
+                if(!net_pair_claim()){
+                    (void)send_resp(fd,cmd,seq,J_AUTH,NULL,0,false,NULL,reply);
+                    break;
+                }
+                // The device never prints a secret. During a physically
+                // authorized window, give it only to the first LAN claimant.
+                // For adversarial LANs, use an encrypted/pinned transport.
+                uint8_t key_material[32];
+                esp_err_t err=secrets_claim_key(key_material);
+                if(err==ESP_OK){
+                    (void)send_resp(fd,cmd,seq,J_OK,key_material,32,false,NULL,reply);
+                    ESP_LOGI(TAG,"first LAN controller claimed physical pairing window");
+                }else{
+                    (void)send_resp(fd,cmd,seq,J_INTERNAL,NULL,0,false,NULL,reply);
+                }
+                memset(key_material,0,sizeof key_material);
+                break; // reconnect for HELLO/AUTH
+            }
             if(cmd==CMD_HELLO && len==0) {
+                // Physical pair mode exclusively accepts PAIR, preventing a
+                // known controller from occupying the single TCP slot.
+                if(net_pair_is_open()){
+                    (void)send_resp(fd,cmd,seq,J_AUTH,NULL,0,false,NULL,reply);
+                    break;
+                }
                 esp_fill_random(nonce,sizeof nonce);
                 have_hello=true;
                 if(send_resp(fd,cmd,seq,J_OK,nonce,sizeof nonce,false,NULL,reply)!=0)break;
                 continue;
             }
-            if(cmd!=CMD_AUTH || len!=32 || !have_hello)break;
+            if(cmd!=CMD_AUTH || len!=32 || !have_hello || !secrets_is_paired())break;
             static const uint8_t auth_suf[]="JMX-AUTH-v1";
             static const uint8_t sess_suf[]="JMX-SESSION-v1";
             uint8_t expected[32];
@@ -162,6 +235,7 @@ static void client_session(int fd)
             esp_restart();
         }
     }
+    memset(session,0,sizeof session);
     free(payload);free(output);free(reply);
     // Safe on control session exit: drop routes, high-Z all IO, release buses.
     api_safe();
@@ -202,8 +276,44 @@ static void listener(void *arg)
         close(server);
     }
 }
+// Read-only LAN broadcast discovery. No secrets or GPIO operations exposed.
+#define DISCOVERY_PORT 4748
+static void discover_task(void *arg)
+{
+    (void)arg;
+    uint8_t mac[6];
+    ESP_ERROR_CHECK(esp_read_mac(mac,ESP_MAC_WIFI_STA));
+    char identity[32];
+    snprintf(identity,sizeof identity,"%02X%02X%02X%02X%02X%02X",
+             mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+    while(true){
+        int sock=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
+        if(sock<0){vTaskDelay(pdMS_TO_TICKS(1000));continue;}
+        struct sockaddr_in addr={.sin_family=AF_INET,.sin_port=htons(DISCOVERY_PORT),
+                                 .sin_addr.s_addr=htonl(INADDR_ANY)};
+        int reuse=1;
+        setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,&reuse,sizeof reuse);
+        if(bind(sock,(struct sockaddr*)&addr,sizeof addr)<0){
+            close(sock);vTaskDelay(pdMS_TO_TICKS(1000));continue;
+        }
+        struct timeval tv={.tv_sec=1,.tv_usec=0};
+        setsockopt(sock,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+        while(true){
+            char data[64];
+            struct sockaddr_in peer;socklen_t n=sizeof peer;
+            int got=recvfrom(sock,data,sizeof data,0,(struct sockaddr*)&peer,&n);
+            if(got!=13 || memcmp(data,"JBOX-DISCOVER",13)!=0 || !wifi_is_ready())continue;
+            char replybuf[52];
+            int written=snprintf(replybuf,sizeof replybuf,"JBOX-HERE|%s|%d|%d",
+                         identity,secrets_is_paired()?1:0,net_pair_is_open()?1:0);
+            if(written>0 && written<(int)sizeof replybuf)
+                (void)sendto(sock,replybuf,written,0,(struct sockaddr*)&peer,n);
+        }
+    }
+}
 void net_start(void)
 {
     // Stack includes TCP + mbedTLS HMAC contexts; RX/TX buffers are heap based.
     xTaskCreatePinnedToCore(listener,"lan-control",12288,NULL,6,NULL,1);
+    xTaskCreatePinnedToCore(discover_task,"lan-discover",4096,NULL,4,NULL,1);
 }

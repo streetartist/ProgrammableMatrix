@@ -1,6 +1,12 @@
 #pragma once
+#include <stdbool.h>
 #include <stdint.h>
-// Persistent per-device secrets. Keep physical UART0 logs private.
+#include "esp_err.h"
+
+// The internal 256-bit control key is never printed or manually entered.
+// It is released once to a LAN controller only while the physical pairing
+// button has enabled a short, single-claim window.
 void secrets_init(void);
-const uint8_t *secrets_key(void); // 32 binary bytes, NEVER transmit to clients
-const char *secrets_pop(void);   // 12 hex digits, printed over physical UART0
+bool secrets_is_paired(void);
+const uint8_t *secrets_key(void);
+esp_err_t secrets_claim_key(uint8_t result[32]);

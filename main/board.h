@@ -10,18 +10,22 @@
 #define BOARD_NODES       52u
 #define BOARD_NETS         8u
 #define BOARD_CHIPS        4u
-#define BOARD_IO          19u
+#define BOARD_IO          18u
 #define BOARD_EXT         9u
 #define BOARD_POWER5      49u
 #define BOARD_POWER33     50u
 #define BOARD_GND         51u
 
 // IO index 0..8 is connected to the crossbar (nodes 40..48).
-// IO index 9..18 is direct expansion and NOT a crossbar node.
+// IO index 9..17 is direct expansion and NOT a crossbar node.
+// GPIO10 is permanently reserved for the active-HIGH physical pairing button.
 static const int BOARD_IO_GPIOS[BOARD_IO] = {
     1,2,3,4,5,6,7,8,9,
-    10,18,21,38,39,40,41,42,47,48
+    18,21,38,39,40,41,42,47,48
 };
+
+// Active-high pairing button: GPIO10 -> switch -> 3.3V, 10k pull-down -> GND.
+#define BOARD_PAIR_BUTTON 10
 
 // Four CH446Q; DAT, CLOCK and RESET common; STB independent.
 #define MATRIX_DAT   11

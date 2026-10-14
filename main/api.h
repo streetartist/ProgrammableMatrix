@@ -4,7 +4,7 @@
 
 // Binary command set, all little endian. Replies start with int32 status.
 enum {
-  CMD_HELLO=0x01, CMD_AUTH=0x02,
+  CMD_HELLO=0x01, CMD_AUTH=0x02, CMD_PAIR=0x03,
   CMD_CAPS=0x10, CMD_STATUS=0x11,
   CMD_ROUTE_SET=0x20, CMD_ROUTE_CONNECT=0x21,
   CMD_ROUTE_REMOVE=0x22, CMD_ROUTE_CLEAR=0x23,
