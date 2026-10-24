@@ -133,7 +133,7 @@ void wifi_ble_start(void)
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
         ESP_ERROR_CHECK(esp_wifi_start());
     }else{
-        ESP_LOGI(TAG,"waiting for active-HIGH GPIO10 pairing button; no serial or PoP needed");
+        ESP_LOGI(TAG,"waiting for active-LOW GPIO10 pairing button; no serial or PoP needed");
     }
 }
 

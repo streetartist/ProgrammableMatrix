@@ -2,6 +2,8 @@
 #include "matrix.h"
 #include "peripherals.h"
 #include "board.h"
+#include "script_service.h"
+#include "script_vm.h"
 #include "esp_timer.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
@@ -16,6 +18,7 @@ static void p64(uint8_t *b,uint64_t v){p32(b,(uint32_t)v);p32(b+4,(uint32_t)(v>>
 static void routes_pack(uint8_t *b) {for(unsigned i=0;i<8;i++)p64(b+8*i,matrix_get()->net[i]);}
 
 void api_safe(void) {
+    script_clear_all();
     matrix_reset();
     peripherals_safe();
 }
@@ -24,6 +27,25 @@ int api_dispatch(uint8_t cmd,const uint8_t *b,size_t n,uint8_t *o,size_t *outn)
     if(!o||!outn||!b)return J_BAD_ARG;
     *outn=0;
     switch(cmd) {
+    case CMD_FUNCTION_LOAD: {
+        if(n<8 || n!=4+(size_t)u16(b+2)*4)return J_BAD_ARG;
+        return script_load(b[0],b[1],b+4,n-4);
+    }
+    case CMD_FUNCTION_CALL: {
+        if(n<2 || n!=2+(size_t)b[1])return J_BAD_ARG;
+        uint32_t values[SCRIPT_MAX_RESULTS];size_t count=0;
+        int rc=script_call(b[0],b+2,b[1],values,&count);
+        if(rc==J_OK){
+            p16(o,(uint16_t)count);
+            for(size_t i=0;i<count;i++)p32(o+2+i*4,values[i]);
+            *outn=2+count*4;
+        }
+        return rc;
+    }
+    case CMD_FUNCTION_CLEAR: {
+        if(n!=1)return J_BAD_ARG;
+        return script_clear(b[0]);
+    }
     case CMD_CAPS: {
         if(n)return J_BAD_ARG;
         o[0]=1;o[1]=BOARD_NODES;o[2]=BOARD_NETS;o[3]=BOARD_IO;
@@ -97,35 +119,40 @@ int api_dispatch(uint8_t cmd,const uint8_t *b,size_t n,uint8_t *o,size_t *outn)
         return rc;
     }
     case CMD_I2C_CLOSE: {
-        if(n!=1)return J_BAD_ARG;return i2c_close(b[0]);
+        if(n!=1)return J_BAD_ARG;
+        return i2c_close(b[0]);
     }
     case CMD_I2C_XFER: {
         if(n<6)return J_BAD_ARG;
         uint16_t nt=u16(b+2),nr=u16(b+4);
         if(nt+nr>API_MAX_XFER || n!=6+(size_t)nt)return J_BAD_ARG;
         int rc=i2c_xfer(b[0],b[1],b+6,nt,o,nr);
-        if(rc==J_OK)*outn=nr;return rc;
+        if(rc==J_OK)*outn=nr;
+        return rc;
     }
     case CMD_SPI_SETUP: {
         if(n!=10)return J_BAD_ARG;
         return spi_setup(b[0],b[1],b[2],b[3],b[4],b[5],u32(b+6));
     }
     case CMD_SPI_CLOSE: {
-        if(n!=1)return J_BAD_ARG;return spi_close(b[0]);
+        if(n!=1)return J_BAD_ARG;
+        return spi_close(b[0]);
     }
     case CMD_SPI_XFER: {
         if(n<3)return J_BAD_ARG;
         uint16_t count=u16(b+1);
         if(count==0 || count>API_MAX_XFER || n!=3+(size_t)count)return J_BAD_ARG;
         int rc=spi_xfer(b[0],b+3,o,count);
-        if(rc==J_OK)*outn=count;return rc;
+        if(rc==J_OK)*outn=count;
+        return rc;
     }
     case CMD_UART_SETUP: {
         if(n!=9)return J_BAD_ARG;
         return uart_setup(b[0],b[1],b[2],u32(b+3),b[7],b[8]);
     }
     case CMD_UART_CLOSE: {
-        if(n!=1)return J_BAD_ARG;return uart_close(b[0]);
+        if(n!=1)return J_BAD_ARG;
+        return uart_close(b[0]);
     }
     case CMD_UART_WRITE: {
         if(n<1 || n-1>API_MAX_XFER)return J_BAD_ARG;
@@ -137,10 +164,12 @@ int api_dispatch(uint8_t cmd,const uint8_t *b,size_t n,uint8_t *o,size_t *outn)
         unsigned count=u16(b+1),timeout=u16(b+3);
         if(count>API_MAX_XFER)return J_BAD_ARG;
         int read=0;int rc=uart_read_api(b[0],o,count,timeout,&read);
-        if(rc==J_OK)*outn=read;return rc;
+        if(rc==J_OK)*outn=read;
+        return rc;
     }
     case CMD_SAFE: {
-        if(n)return J_BAD_ARG;api_safe();return J_OK;
+        if(n)return J_BAD_ARG;
+        api_safe();return J_OK;
     }
     case CMD_FACTORY_RESET: {
         if(n!=4 || memcmp(b,"YES!",4)!=0)return J_BAD_ARG;

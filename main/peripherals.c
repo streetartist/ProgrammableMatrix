@@ -78,7 +78,8 @@ int io_config(unsigned id,unsigned mode,unsigned pull,unsigned initial)
         gpio_reset_pin(pin);
         // Set the output latch BEFORE selecting output direction.
         gpio_set_level(pin,initial);
-        gpio_mode_t m=mode==0?GPIO_MODE_INPUT:mode==1?GPIO_MODE_OUTPUT:GPIO_MODE_INPUT_OUTPUT_OD;
+        // Keep input enabled so IO_READ and scripts can observe output pins.
+        gpio_mode_t m=mode==0?GPIO_MODE_INPUT:mode==1?GPIO_MODE_INPUT_OUTPUT:GPIO_MODE_INPUT_OUTPUT_OD;
         if(gpio_set_direction(pin,m)!=ESP_OK) return J_HARDWARE;
         gpio_pull_mode_t p=pull==0?GPIO_FLOATING:pull==1?GPIO_PULLUP_ONLY:GPIO_PULLDOWN_ONLY;
         if(gpio_set_pull_mode(pin,p)!=ESP_OK) return J_HARDWARE;

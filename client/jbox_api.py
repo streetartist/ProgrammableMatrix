@@ -37,6 +37,7 @@ CMD_I2C_SETUP=0x40;CMD_I2C_CLOSE=0x41;CMD_I2C_XFER=0x42
 CMD_SPI_SETUP=0x50;CMD_SPI_XFER=0x51;CMD_SPI_CLOSE=0x52
 CMD_UART_SETUP=0x60;CMD_UART_WRITE=0x61;CMD_UART_READ=0x62;CMD_UART_CLOSE=0x63
 CMD_SAFE=0x70;CMD_FACTORY_RESET=0x7f
+CMD_FUNCTION_LOAD=0x80;CMD_FUNCTION_CALL=0x81;CMD_FUNCTION_CLEAR=0x82
 
 GPIO_LIST=[1,2,3,4,5,6,7,8,9,18,21,38,39,40,41,42,47,48]
 
@@ -271,6 +272,33 @@ class MatrixClient:
 
     def route_clear(self)->None:self._rpc(CMD_ROUTE_CLEAR)
     def safe(self)->None:self._rpc(CMD_SAFE)
+
+    def upload_function(self, source: str, slot: int=0):
+        """Compile and upload JBoxScript; return a callable remote function."""
+        try:
+            from .jbox_lang import compile_function, RemoteFunction
+        except ImportError:
+            from jbox_lang import compile_function, RemoteFunction
+        if type(slot) is not int or not 0<=slot<4:raise ValueError('function slot 0..3')
+        compiled=compile_function(source)
+        payload=struct.pack('<BBH',slot,len(compiled.parameters),len(compiled.code)//4)+compiled.code
+        self._rpc(CMD_FUNCTION_LOAD,payload)
+        return RemoteFunction(self,slot,compiled)
+
+    def call_function(self, slot: int, io_args: Sequence[int])->list[int]:
+        if type(slot) is not int or not 0<=slot<4:raise ValueError('function slot 0..3')
+        if len(io_args)>4 or any(type(io) is not int or not 0<=io<18 for io in io_args):
+            raise ValueError('function GPIO arguments must be API IO IDs 0..17')
+        if len(set(io_args))!=len(io_args):raise ValueError('function GPIO arguments must be distinct')
+        response=self._rpc(CMD_FUNCTION_CALL,bytes([slot,len(io_args),*io_args]))
+        if len(response)<2:raise IOError('truncated function result')
+        count=struct.unpack_from('<H',response)[0]
+        if count>128 or len(response)!=2+count*4:raise IOError('invalid function result length')
+        return list(struct.unpack_from(f'<{count}I',response,2))
+
+    def clear_function(self, slot: int=0)->None:
+        if type(slot) is not int or not 0<=slot<4:raise ValueError('function slot 0..3')
+        self._rpc(CMD_FUNCTION_CLEAR,bytes([slot]))
 
     def gpio_config(self,io:int,mode:int=0,pull:int=0,initial:int=0)->None:
         """mode 0=input, 1=output, 2=open drain, 3=ADC; pull 0=none 1=up 2=down."""
